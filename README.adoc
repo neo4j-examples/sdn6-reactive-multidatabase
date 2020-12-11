@@ -1,0 +1,218 @@
+SDN 6 Reactive Multi-Database Sample
+====================================
+
+This repository contains an `Application.java` that contains some ideas how you can benefit from
+
+* Neo4j 4.0+ Multi-Database support
+* Neo4j 4.0+ Fabric (Sharded Graphs)
+
+in an application based on
+
+* Spring Boot with Spring Data Neo4j 6
+
+WARNING: A word of warning: The single `Application` class can and should be read from top to bottom.
+         and it contains everything needed. +
+         While this is nice to read, we don't recommend putting everything of your application in a single class.
+
+== Terminology
+
+=== Multi-database support
+
+Neo4j 4.0+ Enterprise edition supports multiple databases per host or cluster.
+Each database supports different users with different roles.
+
+=== Fabric
+
+Fabric is about data sharding.
+Data sharding is dividing data into horizontal partitions that are organized into various instances or servers, most often to spread load across multiple access points.
+These shards can be accessed individually or aggregated to see all of the data, when required.
+
+NOTE: Do I need to use Fabric with to be able to benefit from multiple databases?
+      +
+      No, you don't. It is completely fine to have multiple databases inside a Neo4j cluster that
+      never have a single contact. However, Fabric brings the possibility to query accross multiple
+      databases and aggregate values. This is what is presented here.
+
+=== Multi-tenancy
+
+Multi-tenancy can be implemented with different databases in a safe and clean manner.
+
+SDN 6 has an example on how to do this based on Spring's security context.
+Have a look at the https://docs.spring.io/spring-data/neo4j/docs/6.0.2/reference/html/#faq.multidatabase.dynamically[F.A.Q.].
+This is applicable both to imperative and reactive scenarios and works out of the box with Spring Security.
+
+== This project
+
+This project makes use of the dataset https://neo4j.com/developer/multi-tenancy-worked-example/[Multi Tenancy in Neo4j: A Worked Example]
+and approach presented in the developer pages.
+
+The tenant ("mall1" or "mall2") is set explicitly to the reactive context on each flow.
+This makes it rather easy to select the target database dynamically.
+In addition, the application benefits from a non-blocking, reactive infrastructure.
+
+The custom `ReactiveDatabaseSelectionProvider` is the key here:
+
+[source,java]
+----
+@Bean
+public ReactiveDatabaseSelectionProvider reactiveDatabaseSelectionProvider(
+    Neo4jDataProperties neo4jDataProperties) {
+
+    return () -> Mono.deferContextual(ctx ->
+        Mono.justOrEmpty(ctx.<String>getOrEmpty(KEY_DATABASE_NAME)) // <.>
+            .map(DatabaseSelection::byName)
+            .switchIfEmpty(Mono.just(DatabaseSelection.byName(neo4jDataProperties.getDatabase())))
+    );
+}
+----
+<.> Look up a value under a given key in the reactive context
+    If one is found, select the database by that name,
+    otherwise use the default.
+
+While the examples in the SDN docs use Spring infrastructure to get the the user from a request,
+we want to specify this explicitly:
+
+[source,java]
+----
+clientRepository.findAll()
+    .contextWrite(context -> context.put(KEY_DATABASE_NAME, "mall1"));
+----
+
+The application shows a couple of ways how to wrap this in a neat manner.
+
+NOTE: Should I split domain objects across multiple databases? +
+      +
+      So you want to have parts of a domain object stored in database one and a relation in database two: +
+      While this is technically possible with custom queries, you should *not*. +
+      Spring Data Domain objects - everything annotated with `@Node`, are aggregates and should
+      be seen as a whole. If you retrieve the data in parts from multiple database and want to store that
+      object again, SDN does not know which parts come from wich database and you will end up
+      with things being stored somewhere they don't belong.
+
+== Setup
+
+Please follow https://neo4j.com/developer/multi-tenancy-worked-example/[Multi Tenancy in Neo4j: A Worked Example].
+
+The condensed essence here is:
+
+* Download Neo4j 4.x enterprise edition in a form that works for you (either Neo4j Desktop, Server or Docker)
+* Download the https://drive.google.com/a/neotechnology.com/uc?id=1wDNAMFk_3-H1l44ID4P6fcE6K7cvG9iX&export=download[dataset] and
+  store it inside your Neo4j installation under `import/DelightingCustomersBDclean.json`.
+  The original data is on https://github.com/ging/carrefour_basket_data_challenge[GitHub] as well.
+* Make sure APOC is installed for data loading
+* Create both databases `mall1` and `mall2`
+* Configure fabric and APOC
+* Load the data
+
+=== Database creation
+
+[source,cypher]
+----
+:use system;
+
+CREATE DATABASE mall1;
+CREATE INDEX on :Ticket(id);
+CREATE INDEX on :Client(id);
+CREATE INDEX on :Product(description);
+CREATE INDEX on :TicketItem(netAmount);
+CREATE INDEX on :TicketItem(units);
+CREATE INDEX on :TicketItem(product);
+
+CREATE DATABASE mall2;
+CREATE INDEX on :Ticket(id);
+CREATE INDEX on :Client(id);
+CREATE INDEX on :Product(description);
+CREATE INDEX on :TicketItem(netAmount);
+CREATE INDEX on :TicketItem(units);
+CREATE INDEX on :TicketItem(product);
+----
+
+=== Configure fabric and APOC
+
+[source,properties]
+.neo4j.conf
+----
+fabric.database.name=fabric
+
+fabric.graph.0.name=mall1
+fabric.graph.0.uri=neo4j://localhost:7687
+fabric.graph.0.database=mall1
+
+fabric.graph.1.name=mall2
+fabric.graph.1.uri=neo4j://localhost:7687
+fabric.graph.1.database=mall2
+
+dbms.security.procedures.unrestricted=apoc.*
+----
+
+[source,properties]
+.apoc.conf
+----
+apoc.import.file.enabled=true
+----
+
+=== Data loading
+
+[source,cypher]
+----
+:use mall1;
+:param params => ({ url: "file:///DelightingCustomersBDclean.json", mall: 1});
+
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json($url)
+   YIELD value
+   WHERE value.mall = $mall
+   RETURN value
+   LIMIT 20000",
+  "CREATE (t:Ticket {id: value._id, datetime: datetime(value.date)})
+   MERGE (c:Client {id: value.client})
+   CREATE (c)-[:PURCHASED]->(t)
+   WITH value, t
+   UNWIND value.items as item
+   CREATE (t)-[:HAS_TICKETITEM]->(ti:TicketItem {
+     product: item.desc,
+     netAmount: item.net_am,
+     units: item.n_unit
+   })
+   MERGE (p:Product {description: item.desc})
+   CREATE (ti)-[:FOR_PRODUCT]->(p)",
+  { batchSize: 10000,
+    iterateList: true,
+    parallel: false,
+    params: $params }
+);
+
+:use mall2;
+:param params => ({ url: "file:///DelightingCustomersBDclean.json", mall: 2});
+
+CREATE INDEX on :Ticket(id);
+CREATE INDEX on :Client(id);
+CREATE INDEX on :Product(description);
+CREATE INDEX on :TicketItem(netAmount);
+CREATE INDEX on :TicketItem(units);
+CREATE INDEX on :TicketItem(product);
+
+CALL apoc.periodic.iterate(
+  "CALL apoc.load.json($url)
+   YIELD value
+   WHERE value.mall = $mall
+   RETURN value
+   LIMIT 20000",
+  "CREATE (t:Ticket {id: value._id, datetime: datetime(value.date)})
+   MERGE (c:Client {id: value.client})
+   CREATE (c)-[:PURCHASED]->(t)
+   WITH value, t
+   UNWIND value.items as item
+   CREATE (t)-[:HAS_TICKETITEM]->(ti:TicketItem {
+     product: item.desc,
+     netAmount: item.net_am,
+     units: item.n_unit
+   })
+   MERGE (p:Product {description: item.desc})
+   CREATE (ti)-[:FOR_PRODUCT]->(p)",
+  { batchSize: 10000,
+    iterateList: true,
+    parallel: false,
+    params: $params }
+);
+----
